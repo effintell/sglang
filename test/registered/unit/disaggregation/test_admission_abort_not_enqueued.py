@@ -34,6 +34,9 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.separate_buffer_allocator_double import (
+    separate_buffer_allocator_double,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -97,6 +100,35 @@ def _decode_queue(sched):
     )
     # Exercise the production initializer reached by the cache-hit fast path.
     q._init_receiver = MethodType(DecodePreallocQueue._init_receiver, q)
+    return q
+
+
+def _prefill_queue_with_capacity(sched, max_total_num_tokens):
+    q = SimpleNamespace(
+        scheduler=sched, queue=[], max_total_num_tokens=max_total_num_tokens
+    )
+    for name in ("create_sender", "_check_if_req_exceed_kv_capacity"):
+        setattr(q, name, MethodType(getattr(PrefillBootstrapQueue, name), q))
+    return q
+
+
+def _decode_queue_with_capacity(sched, max_total_num_tokens):
+    sched.enable_hisparse = False
+    q = _decode_queue(sched)
+    q.max_total_num_tokens = max_total_num_tokens
+    q.num_reserved_decode_tokens = 0
+    q.token_to_kv_pool_allocator = separate_buffer_allocator_double(
+        page_size=1, size_swa=10**9
+    )
+    q._uses_swa_tail_prealloc = MagicMock(return_value=False)
+    for name in (
+        "_check_if_req_exceed_kv_capacity",
+        "_prealloc_required_tokens",
+        "_prealloc_kv_lens",
+    ):
+        setattr(q, name, MethodType(getattr(DecodePreallocQueue, name), q))
+    q._pre_alloc_fill_len = DecodePreallocQueue._pre_alloc_fill_len
+    q._rebootstrap_prefill_len = DecodePreallocQueue._rebootstrap_prefill_len
     return q
 
 
@@ -269,6 +301,59 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     receiver = q._create_receiver_and_enqueue.return_value.kv_receiver
                     receiver.init.assert_called_once_with(0)
                 sched.retire_unadmitted_request.assert_not_called()
+
+    def test_over_capacity_request_is_retired_at_each_pd_door(self):
+        """A prompt larger than the KV pool must leave no in-flight state behind.
+
+        Its streaming session is detached, or every later turn on it is
+        rejected, and its cache handle is finished as ABORT.
+        """
+        for door in ("prefill", "decode"):
+            with self.subTest(door=door):
+                session = MagicMock()
+                session.streaming = True
+                req = _make_req(prompt_len=1500, session=session)
+
+                sched = _make_scheduler()
+                if door == "prefill":
+                    q = _prefill_queue_with_capacity(sched, max_total_num_tokens=1024)
+                    _admit_prefill(q, req)
+                    self.assertEqual(q.queue, [])
+                    self.assertIsNone(req.disagg_kv_sender)
+                else:
+                    q = _decode_queue_with_capacity(sched, max_total_num_tokens=1024)
+                    _admit_decode(q, req)
+                    q._create_receiver_and_enqueue.assert_not_called()
+                    self.assertEqual(q.pending_reqs, [])
+                sched.retire_unadmitted_request.assert_called_once_with(req)
+                session.abort_req.assert_called_once()
+                self.assertIsNone(req.session)
+                sched._release_aborted_request.assert_called_once_with(req)
+                self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+                self.assertEqual(
+                    req.finished_reason.status_code, HTTPStatus.BAD_REQUEST
+                )
+                sched.output_streamer.stream_output.assert_called_once()
+
+    def test_over_capacity_reentering_decode_request_is_not_retired(self):
+        """A re-entering request may hold a host KV backup, so it is not retired."""
+        for flag in ("is_retracted", "is_rebootstrap"):
+            with self.subTest(flag=flag):
+                req = _make_req(prompt_len=1500)
+                req.kv.retraction_backup = object()
+
+                sched = _make_scheduler()
+                q = _decode_queue_with_capacity(sched, max_total_num_tokens=1024)
+                _admit_decode(q, req, **{flag: True})
+                sched.retire_unadmitted_request.assert_not_called()
+                self.assertEqual(q.retracted_queue, [])
+                q._create_receiver_and_enqueue.assert_not_called()
+                self.assertEqual(
+                    req.finished_reason.status_code, HTTPStatus.BAD_REQUEST
+                )
+                sched.output_streamer.stream_output.assert_called_once_with(
+                    [req], req.return_logprob
+                )
 
     def test_null_mode_is_deliberately_untouched(self):
         """The bug is disaggregation-only; NULL mode must keep enqueuing.

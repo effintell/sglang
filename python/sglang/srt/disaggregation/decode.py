@@ -811,6 +811,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             is_rebootstrap = True
 
         if self._check_if_req_exceed_kv_capacity(req):
+            # Same split as the door above: retiring assumes the request holds
+            # nothing, and a re-entering one may still hold a host KV backup.
+            if is_retracted or is_rebootstrap:
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            else:
+                self.scheduler.retire_unadmitted_request(req)
             return
 
         if is_retracted:
@@ -970,7 +976,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
 

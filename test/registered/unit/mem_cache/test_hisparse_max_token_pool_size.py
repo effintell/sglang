@@ -117,7 +117,6 @@ def _make_prealloc_queue(
     queue.scheduler = SimpleNamespace(
         enable_hisparse=enable_hisparse,
         tp_worker=tp_worker,
-        output_streamer=MagicMock(),
     )
     return queue
 
@@ -150,7 +149,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-long", prompt_len=2048)
 
         self.assertFalse(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_not_called()
+        self.assertIsNone(req.finished_reason)
 
     def test_hisparse_rejects_beyond_host_backed_size(self):
         """Requests longer than host-backed capacity are still aborted."""
@@ -162,9 +161,6 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-too-long", prompt_len=5000)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], req.return_logprob
-        )
         # prepare_abort sets finished_reason to a BAD_REQUEST FINISH_ABORT.
         self.assertIsNotNone(req.finished_reason)
 
@@ -179,9 +175,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("non-hisparse-too-long", prompt_len=2048)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], req.return_logprob
-        )
+        self.assertIsNotNone(req.finished_reason)
 
     def test_rebootstrap_input_len_used_for_capacity(self):
         """Rebootstrap requests carry both prompt and emitted output_ids; the
