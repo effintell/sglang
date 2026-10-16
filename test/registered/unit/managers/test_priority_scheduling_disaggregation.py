@@ -424,7 +424,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         release_kv_cache.assert_called_once_with(
             req, scheduler.tree_cache, checkpoint=False
         )
-        sender.abort.assert_called_once()
+        sender.release_after_abort.assert_called_once_with()
         self.assertFalse(req.pending_bootstrap)
 
     def test_scheduler_waiting_abort_delegates_release_once(self):

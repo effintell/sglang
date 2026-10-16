@@ -231,6 +231,13 @@ class BaseKVSender(ABC):
         """
         pass
 
+    def release_after_abort(self) -> None:
+        """
+        Abort the transfer for a request the scheduler will never poll again,
+        and drop whatever per-request state no later poll would clear.
+        """
+        self.abort()
+
 
 class BaseKVReceiver(ABC):
     @property

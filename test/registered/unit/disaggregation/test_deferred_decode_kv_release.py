@@ -510,6 +510,63 @@ class TestDeferredAckTargets(CustomTestCase):
         self.assertEqual(mgr._prefill_unique_rank(), 31)
 
 
+def _aborting_prefill_sender(status):
+    mgr = _make_prefill_manager()
+    mgr.failure_records = {}
+    mgr.failure_lock = threading.Lock()
+    mgr.request_status = {7: status}
+    if status != KVPoll.Bootstrapping:
+        mgr.transfer_infos = {7: {"decode-session": object()}}
+        mgr.req_to_decode_prefix_len = {7: 0}
+    sender = _TestSender.__new__(_TestSender)
+    sender.kv_mgr = mgr
+    sender.bootstrap_room = 7
+    return mgr, sender
+
+
+class TestSenderReleaseAfterAbort(CustomTestCase):
+    def test_bootstrapped_room_is_dropped(self):
+        """An aborted request leaves every queue, so nothing polls its room again."""
+        for status in (KVPoll.WaitingForInput, KVPoll.Transferring, KVPoll.Success):
+            with self.subTest(status=status):
+                mgr, sender = _aborting_prefill_sender(status)
+
+                sender.release_after_abort()
+
+                self.assertEqual(sender.conclude_state, KVPoll.Failed)
+                for table in (
+                    mgr.request_status,
+                    mgr.transfer_infos,
+                    mgr.req_to_decode_prefix_len,
+                    mgr.failure_records,
+                ):
+                    self.assertNotIn(7, table)
+
+    def test_bootstrapping_room_keeps_failed_tombstone(self):
+        """Decode's pre-alloc message may still land and must not revive the room."""
+        mgr, sender = _aborting_prefill_sender(KVPoll.Bootstrapping)
+
+        sender.release_after_abort()
+        # What the bootstrap thread does once decode's last pre-alloc lands.
+        mgr.update_status(7, KVPoll.WaitingForInput)
+
+        self.assertEqual(sender.conclude_state, KVPoll.Failed)
+        self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+
+    def test_non_owner_leaves_the_owners_room_alone(self):
+        """A duplicate deferred-bootstrap sender must not wipe the owner's room."""
+        mgr, sender = _aborting_prefill_sender(KVPoll.WaitingForInput)
+        mgr.deferred_bootstrap = object()
+        mgr.failure_records[7] = "owner's root cause"
+        sender._owns_bootstrap_room = False
+
+        sender.release_after_abort()
+
+        self.assertEqual(mgr.request_status[7], KVPoll.WaitingForInput)
+        self.assertEqual(mgr.failure_records[7], "owner's root cause")
+        self.assertIn(7, mgr.transfer_infos)
+
+
 class TestAbortAckAggregation(CustomTestCase):
     def test_release_safe_only_after_all_required_ranks_ack(self):
         mgr = _make_manager()

@@ -572,9 +572,8 @@ class SchedulerDisaggregationPrefillMixin:
 
     def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
-        sender = getattr(req, "disagg_kv_sender", None)
-        if sender is not None and hasattr(sender, "abort"):
-            sender.abort()
+        if req.disagg_kv_sender is not None:
+            req.disagg_kv_sender.release_after_abort()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -1291,7 +1290,7 @@ class SchedulerDisaggregationPrefillMixin:
         sender = req.disagg_kv_sender
         if sender is not None:
             try:
-                sender.abort()
+                sender.release_after_abort()
             except Exception:
                 # Transport notification is best effort; local ownership must
                 # still be released or the next idle invariant check will fail.

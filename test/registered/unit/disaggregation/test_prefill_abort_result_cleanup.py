@@ -112,7 +112,7 @@ def test_aborted_final_result_releases_hybrid_cache(
         req, scheduler.tree_cache, checkpoint=False
     )
     checkpoint_kv_cache.assert_not_called()
-    req.disagg_kv_sender.abort.assert_called_once_with()
+    req.disagg_kv_sender.release_after_abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.tree_cache.finish.assert_called_once_with(
         req.cache_request_handle, CacheRequestOutcome.ABORT
@@ -167,7 +167,7 @@ def test_delayed_result_ignores_already_retired_request(release_kv_cache):
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
     release_kv_cache.assert_not_called()
-    req.disagg_kv_sender.abort.assert_not_called()
+    req.disagg_kv_sender.release_after_abort.assert_not_called()
     scheduler.output_streamer.stream_output.assert_not_called()
 
 
@@ -175,7 +175,9 @@ def test_delayed_result_ignores_already_retired_request(release_kv_cache):
 def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=0)
-    req.disagg_kv_sender.abort.side_effect = RuntimeError("transport is down")
+    req.disagg_kv_sender.release_after_abort.side_effect = RuntimeError(
+        "transport is down"
+    )
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
@@ -247,7 +249,7 @@ def test_failed_kv_load_is_aborted_instead_of_sent_to_decode(release_kv_cache):
     release_kv_cache.assert_called_once_with(
         req, scheduler.tree_cache, checkpoint=False
     )
-    req.disagg_kv_sender.abort.assert_called_once_with()
+    req.disagg_kv_sender.release_after_abort.assert_called_once_with()
     scheduler.send_kv_chunk.assert_not_called()
 
 
@@ -273,7 +275,9 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     req.return_sampling_mask = True
     req.time_stats.trace_ctx = Mock()
     if transport_error:
-        req.disagg_kv_sender.abort.side_effect = RuntimeError("transport is down")
+        req.disagg_kv_sender.release_after_abort.side_effect = RuntimeError(
+            "transport is down"
+        )
     result = GenerationBatchResult(
         next_token_ids=torch.tensor([11]),
         logits_output=LogitsProcessorOutput(
@@ -295,7 +299,7 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     release_kv_cache.assert_called_once_with(
         req, scheduler.tree_cache, checkpoint=False
     )
-    req.disagg_kv_sender.abort.assert_called_once_with()
+    req.disagg_kv_sender.release_after_abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.tree_cache.finish.assert_called_once_with(
         req.cache_request_handle, CacheRequestOutcome.ABORT

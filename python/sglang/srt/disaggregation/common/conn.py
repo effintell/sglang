@@ -2171,6 +2171,19 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
 
+    def release_after_abort(self) -> None:
+        if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
+            return
+        status = self.kv_mgr.request_status.get(self.bootstrap_room)
+        self.abort()
+        # Until decode's last pre-alloc message lands, the bootstrap thread would
+        # recreate a cleared room as WaitingForInput; keep the Failed tombstone.
+        if status not in (KVPoll.WaitingForInput, KVPoll.Transferring, KVPoll.Success):
+            return
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        self.clear()
+
 
 class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
