@@ -29,6 +29,7 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         # is tested, or build a real manager instance.
         sender.kv_mgr = SimpleNamespace(
             deferred_bootstrap=None,
+            _bootstrap_incomplete_failures=None,
             enable_staging=True,
             _staging_ctx=staging_ctx,
             request_status={room: object()},

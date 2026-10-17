@@ -269,6 +269,10 @@ class DeferredAbortAckState(msgspec.Struct):
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
+    # None (the class default) behaves like an empty set for callers that
+    # build a manager via __new__ and never run __init__ (see update_status()
+    # / clear() below); a real set is created lazily on first write.
+    _bootstrap_incomplete_failures: Optional[Set[int]] = None
 
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
@@ -584,9 +588,21 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                if self._bootstrap_incomplete_failures is not None:
+                    self._bootstrap_incomplete_failures.discard(bootstrap_room)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
+            if current == KVPoll.Bootstrapping and self.deferred_bootstrap is None:
+                # Decode's registration isn't fully in yet, and (unlike
+                # deferred_bootstrap mode, where a BOOTSTRAP message never
+                # calls update_status) a late one here would call this same
+                # branch with WaitingForInput and resurrect the room via the
+                # current-is-None case above. clear() must keep the Failed
+                # status as a tombstone to block that.
+                if self._bootstrap_incomplete_failures is None:
+                    self._bootstrap_incomplete_failures = set()
+                self._bootstrap_incomplete_failures.add(bootstrap_room)
             self.request_status[bootstrap_room] = KVPoll.Failed
             if self.deferred_bootstrap is not None:
                 self._notify_bootstrap(
@@ -2135,6 +2151,9 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        incomplete = self.kv_mgr._bootstrap_incomplete_failures
+        if incomplete is not None and self.bootstrap_room in incomplete:
+            return
         notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
             if not self._owns_bootstrap_room:

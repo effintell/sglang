@@ -103,6 +103,7 @@ def _make_prefill_manager():
     mgr._deferred_ack_targets = {}
     mgr._deferred_ack_poisoned_rooms = set()
     mgr._staging_outstanding = {}
+    mgr._bootstrap_incomplete_failures = set()
     mgr._sent = []
     mgr._send_abort_ack = lambda *args: mgr._sent.append(args)
     return mgr
@@ -565,6 +566,65 @@ class TestSenderReleaseAfterAbort(CustomTestCase):
         self.assertEqual(mgr.request_status[7], KVPoll.WaitingForInput)
         self.assertEqual(mgr.failure_records[7], "owner's root cause")
         self.assertIn(7, mgr.transfer_infos)
+
+
+class TestClearGuardsBootstrapIncompleteFailure(CustomTestCase):
+    """release_after_abort() only guards the explicit-AbortReq path. The same
+    zombie-room race is reachable via bootstrap timeout: _check_bootstrap_timeout()
+    marks a still-Bootstrapping room Failed, and every backend's
+    failure_exception() then calls sender.clear() unconditionally, with none
+    of release_after_abort()'s snapshot-before-abort guard. update_status()
+    and clear() must close that path too, driven only by the room's real
+    state transitions (not by a caller-side snapshot)."""
+
+    def test_timeout_style_failure_keeps_the_tombstone(self):
+        mgr, sender = _aborting_prefill_sender(KVPoll.Bootstrapping)
+        mgr.transfer_infos[7] = {"decode-session": object()}
+        mgr.req_to_decode_prefix_len[7] = 0
+
+        # What _check_bootstrap_timeout() does: mark Failed while still
+        # Bootstrapping, with no release_after_abort() call involved.
+        mgr.update_status(7, KVPoll.Failed)
+        sender.clear()
+
+        self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+        self.assertIn(7, mgr.transfer_infos)
+        self.assertIn(7, mgr.req_to_decode_prefix_len)
+
+    def test_late_registration_after_timeout_failure_is_a_noop(self):
+        mgr, sender = _aborting_prefill_sender(KVPoll.Bootstrapping)
+        mgr.update_status(7, KVPoll.Failed)
+        sender.clear()
+
+        # What the bootstrap thread does once decode's last pre-alloc
+        # message lands late.
+        mgr.update_status(7, KVPoll.WaitingForInput)
+
+        self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+
+    def test_reused_room_id_resets_the_guard(self):
+        mgr, sender = _aborting_prefill_sender(KVPoll.Bootstrapping)
+        mgr.update_status(7, KVPoll.Failed)
+        sender.clear()
+        self.assertIn(7, mgr._bootstrap_incomplete_failures)
+
+        # A fresh request reusing the same bootstrap_room starts a new
+        # lifecycle: this must drop the stale guard, or a legitimate reuse
+        # of this room id would never be clearable again.
+        mgr.request_status.pop(7, None)
+        mgr.update_status(7, KVPoll.Bootstrapping)
+
+        self.assertNotIn(7, mgr._bootstrap_incomplete_failures)
+
+        # That new lifecycle completes bootstrap and later clears normally.
+        mgr.transfer_infos[7] = {"decode-session": object()}
+        mgr.req_to_decode_prefix_len[7] = 0
+        mgr.update_status(7, KVPoll.WaitingForInput)
+        sender.clear()
+
+        self.assertNotIn(7, mgr.request_status)
+        self.assertNotIn(7, mgr.transfer_infos)
+        self.assertNotIn(7, mgr.req_to_decode_prefix_len)
 
 
 class TestAbortAckAggregation(CustomTestCase):
